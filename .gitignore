@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+Code/checkpoints/
+Code/generated_mtfs/
+Code/generated_images_spline/
+Data_Root/
+Code/reconstructed.nii

@@ -94,34 +94,85 @@ def save_checkpoint(epoch, net, D_sharp, D_smooth, opt_G, opt_Ds, scaler, loss_h
     torch.save(checkpoint, filepath)
     print(f"Checkpoint saved: {filepath}")
 # takes in a 2d mtf
-def generate_images(I_smooth, I_sharp, mtf_smooth, mtf_sharp, epsilon=1e-8):
+def generate_images(I_smooth, I_sharp, mtf_smooth, mtf_sharp, epsilon=1e-6):
     """
-    Args:
-        I_smooth, I_sharp: [B, 1, H, W] spatial domain images
-        mtf_smooth, mtf_sharp: [B, 1, H, W] frequency domain MTF maps (output of KernelEstimator)
-        epsilon: Small constant to prevent division by zero
-    
-    Returns:
-        I_gen_sharp, I_gen_smooth: [1, 1, H, W] generated images (averaged over batch)
+    I_smooth, I_sharp: [B, 1, H, W] images
+    mtf_smooth, mtf_sharp: [B, 1, H, W] 2D MTF maps
+    Returns single [1, 1, H, W] images for discriminator
     """
+    B, _, H, W = I_smooth.shape
     
-    # 1. Convert Images to Frequency Domain
-    # We use fftshift so the zero-frequency component moves from corners (0,0) 
-    # to the center (H//2, W//2), matching the alignment of your mtf_smooth/sharp maps.
+    # FFT with fftshift to center zero frequency
     F_smooth = torch.fft.fftshift(torch.fft.fft2(I_smooth))
     F_sharp = torch.fft.fftshift(torch.fft.fft2(I_sharp))
 
-    OTF_s2h = mtf_sharp / (mtf_smooth + epsilon)
-    OTF_h2s = mtf_smooth / (mtf_sharp + epsilon)
-    F_gen_sharp = F_smooth * OTF_s2h
-    F_gen_smooth = F_sharp * OTF_h2s
+    # Compute frequency-dependent transfer functions
+    mtf_smooth_safe = torch.clamp(mtf_smooth, min=epsilon)
+    mtf_sharp_safe = torch.clamp(mtf_sharp, min=epsilon)
+    
+    H_s2h = mtf_sharp_safe / (mtf_smooth_safe + epsilon)
+    H_h2s = mtf_smooth_safe / (mtf_sharp_safe + epsilon)
+    
+    # Clamp to prevent extreme amplification/suppression
+    H_s2h = torch.clamp(H_s2h, min=0.1, max=5.0)
+    H_h2s = torch.clamp(H_h2s, min=0.1, max=5.0)
+
+    # Apply transfer functions in frequency domain
+    F_gen_sharp = F_smooth * H_s2h
+    F_gen_smooth = F_sharp * H_h2s
+
+    # IFFT back to spatial domain
     I_gen_sharp = torch.real(torch.fft.ifft2(torch.fft.ifftshift(F_gen_sharp)))
     I_gen_smooth = torch.real(torch.fft.ifft2(torch.fft.ifftshift(F_gen_smooth)))
 
-    I_gen_sharp = I_gen_sharp.mean(dim=0, keepdim=True).clamp(0, 1)
-    I_gen_smooth = I_gen_smooth.mean(dim=0, keepdim=True).clamp(0, 1)
+    # Normalize WITHOUT in-place operations (create new tensors)
+    # Method 1: Normalize globally across the batch
+    sharp_min = I_gen_sharp.min()
+    sharp_max = I_gen_sharp.max()
+    if sharp_max > sharp_min:
+        I_gen_sharp = (I_gen_sharp - sharp_min) / (sharp_max - sharp_min)
+    else:
+        I_gen_sharp = torch.zeros_like(I_gen_sharp)
+    
+    smooth_min = I_gen_smooth.min()
+    smooth_max = I_gen_smooth.max()
+    if smooth_max > smooth_min:
+        I_gen_smooth = (I_gen_smooth - smooth_min) / (smooth_max - smooth_min)
+    else:
+        I_gen_smooth = torch.zeros_like(I_gen_smooth)
+    
+    I_gen_sharp = torch.clamp(I_gen_sharp, 0, 1)
+    I_gen_smooth = torch.clamp(I_gen_smooth, 0, 1)
+
+    # Average over batch dimension
+    I_gen_sharp = I_gen_sharp.mean(dim=0, keepdim=True)
+    I_gen_smooth = I_gen_smooth.mean(dim=0, keepdim=True)
 
     return I_gen_sharp, I_gen_smooth
+def compute_radial_profile(image_2d, H, W):
+    """
+    Compute radial average of a 2D array
+    
+    Args:
+        image_2d: [H, W] numpy array
+        H, W: dimensions
+    
+    Returns:
+        radial_profile: 1D array of radial averages
+    """
+    cy, cx = H // 2, W // 2
+    y, x = np.ogrid[:H, :W]
+    r = np.sqrt((x - cx)**2 + (y - cy)**2).astype(int)
+    
+    max_r = int(np.sqrt(cy**2 + cx**2))
+    radial_profile = np.zeros(max_r)
+    
+    for radius in range(max_r):
+        mask = (r == radius)
+        if mask.sum() > 0:
+            radial_profile[radius] = image_2d[mask].mean()
+    
+    return radial_profile
 
 def normalize(x):
     return (x - x.min()) / (x.max() - x.min() + 1e-8)
@@ -159,3 +210,74 @@ def update_moving_average(history, window=10):
     if len(history) < window:
         return sum(history) / len(history)
     return sum(history[-window:]) / window
+
+def validate(net, D_sharp, D_smooth, val_loader, device, bce, l1):
+    net.eval()
+    D_sharp.eval()
+    D_smooth.eval()
+    
+    val_metrics = {
+        'G_loss': 0.0,
+        'D_loss': 0.0,
+        'recon_loss': 0.0,
+        'gan_loss': 0.0,
+        'D_sharp_loss': 0.0,
+        'D_smooth_loss': 0.0,
+    }
+    
+    with torch.no_grad():
+        for I_smooth, I_sharp, _, _ in val_loader:
+            I_smooth = I_smooth.to(device)
+            I_sharp = I_sharp.to(device)
+            
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=(device == "cuda")):
+                # Generate scalar kernels [B, 1]
+                k_smooth = net(I_smooth)
+                k_sharp = net(I_sharp)
+                
+                # Generate images - returns [1, 1, H, W] (batch-averaged)
+                I_gen_sharp, I_gen_smooth = generate_images(I_smooth, I_sharp, k_smooth, k_sharp)
+                
+                # Generated images are [1, 1, H, W], so B_gen = 1
+                B_gen = 1
+                real_label = torch.ones(B_gen, 1, device=device)
+                fake_label = torch.zeros(B_gen, 1, device=device)
+                
+                # Use single real sample to match generated image size
+                I_sharp_single = I_sharp[0:1]
+                I_smooth_single = I_smooth[0:1]
+                
+                # Discriminator losses
+                out_real_sharp = D_sharp(I_sharp_single)
+                out_fake_sharp = D_sharp(I_gen_sharp)
+                loss_D_sharp = 0.5 * (bce(out_real_sharp, real_label) + bce(out_fake_sharp, fake_label))
+                
+                out_real_smooth = D_smooth(I_smooth_single)
+                out_fake_smooth = D_smooth(I_gen_smooth)
+                loss_D_smooth = 0.5 * (bce(out_real_smooth, real_label) + bce(out_fake_smooth, fake_label))
+                
+                loss_D = loss_D_sharp + loss_D_smooth
+                
+                # Generator losses
+                out_fake_sharp_G = D_sharp(I_gen_sharp)
+                out_fake_smooth_G = D_smooth(I_gen_smooth)
+                gan_loss = 0.5 * (bce(out_fake_sharp_G, real_label) + bce(out_fake_smooth_G, real_label))
+                
+                # Reconstruction loss: compare against batch-averaged real images
+                I_sharp_avg = I_sharp.mean(dim=0, keepdim=True)
+                I_smooth_avg = I_smooth.mean(dim=0, keepdim=True)
+                recon_loss = l1(I_gen_sharp, I_sharp_avg) + l1(I_gen_smooth, I_smooth_avg)
+                
+                loss_G = 0.1 * recon_loss + 0.01 * gan_loss
+                
+                val_metrics['G_loss'] += loss_G.item()
+                val_metrics['D_loss'] += loss_D.item()
+                val_metrics['recon_loss'] += recon_loss.item()
+                val_metrics['gan_loss'] += gan_loss.item()
+                val_metrics['D_sharp_loss'] += loss_D_sharp.item()
+                val_metrics['D_smooth_loss'] += loss_D_smooth.item()
+    
+    for key in val_metrics:
+        val_metrics[key] /= len(val_loader)
+    
+    return val_metrics

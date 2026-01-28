@@ -17,8 +17,7 @@ class Discriminator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
 
             nn.Conv2d(64, 1, 4, padding=0),             # [B,64,64,64] to [B,1,61,61]
-            nn.AdaptiveAvgPool2d((1, 1)),               # [B,1,1,1]
-            nn.Sigmoid()                                # ensure output in [0,1]
+            nn.AdaptiveAvgPool2d((1, 1)),               # [B,1,1,1]                            # ensure output in [0,1]
         )
 
     def forward(self, x):
